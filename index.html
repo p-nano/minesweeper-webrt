@@ -1,180 +1,57 @@
-<!DOCTYPE html>
-<html>
-    <head>
-        <title>WebRTCの実験</title>
-        <meta charset="utf-8">
-        <style>
-        </style>
-    </head>
-    <body>
-        <h1>WebRTCの実験</h1>
-        <textarea id="message" rows="4" cols="90" placeholder="Enter message here"></textarea>
-        <button id="sendMessage">送信</button>
+// 必要: npm install ws
+const WebSocket = require("ws");
 
-        <script>
-            const peerConnections = new Map();
+const wss = new WebSocket.Server({ port: 8081 });
 
-+           const dataChannels = new Map();  // 相手ごとのデータチャネルを管理 //
+let clients = new Map(); // id -> ws
+let nextId = 1;
 
-            const signalingConnection = new WebSocket("ws://localhost:8081");
-            let myID = null;
+wss.on("connection", (ws) => {
+    const myID = nextId++;
+    clients.set(myID, ws);
 
-            // ボタン
-            document.getElementById("sendMessage").addEventListener("click", () => {
-                const message = document.getElementById("message").value;
-                // 接続している全員にメッセージを送信 // DIFF
+    // 接続したクライアントに自分のIDと既存クライアントを通知
+    ws.send(JSON.stringify({
+        type: "init",
+        id: myID,
+        connected: Array.from(clients.keys())
+    }));
 
-+               dataChannels.forEach((channel, peerId) => {
+    // 他のクライアントにも通知（新規接続）
+    for (let [id, client] of clients) {
+        if (id !== myID) {
+            client.send(JSON.stringify({
+                type: "new-peer",
+                id: myID
+            }));
+        }
+    }
 
-+                   if (channel.readyState === "open") {
+    ws.on("message", (data) => {
+        let message;
+        try {
+            message = JSON.parse(data);
+        } catch (e) {
+            console.error("Invalid message:", data);
+            return;
+        }
 
-+                       channel.send(message);
+        // 送信先が指定されている場合だけ転送
+        if (message.to && clients.has(message.to)) {
+            clients.get(message.to).send(JSON.stringify(message));
+        }
+    });
 
-+                       console.log("sent to " + peerId + ": " + message);
+    ws.on("close", () => {
+        clients.delete(myID);
+        // 他のクライアントに切断を通知
+        for (let client of clients.values()) {
+            client.send(JSON.stringify({
+                type: "peer-left",
+                id: myID
+            }));
+        }
+    });
+});
 
-+                   }
-
-+               });
-
-            });
-
-            function setupPeerConnection(remoteId) {
-                const peerConnection = new RTCPeerConnection({
-                    iceServers: [{urls: "stun:stun.l.google.com:19302"}]
-                });
-                peerConnections.set(remoteId, peerConnection);
-
-                // 受信側のデータチャネル設定を追加
-
-+               peerConnection.ondatachannel = (event) => {
-
-+                   const channel = event.channel;
-
-+                   channel.onopen = () => {
-
-+                       console.log("Data Channel Opened with " + remoteId);
-
-+                   }
-
-+                   channel.onmessage = (event) => {
-
-+                       console.log("Received from " + remoteId + ": " + event.data);
-
-+                   }
-
-+                   dataChannels.set(remoteId, channel);
-
-+               };
-
-+
-
-+               // 送信側のデータチャネル設定
-
-+               const channel = peerConnection.createDataChannel("chat");
-
-+               channel.onopen = () => {
-
-+                   console.log("Data Channel Opened with " + remoteId);
-
-+               }
-
-+               channel.onmessage = (event) => {
-
-+                   console.log("Received from " + remoteId + ": " + event.data);
-
-+               }
-
-+               dataChannels.set(remoteId, channel);
-
-
-                peerConnection.onicecandidate = (event) => {
-                    if (event.candidate) {
-                        signalingConnection.send(JSON.stringify({
-                            type: "ice",
-                            from: myID,
-                            to: remoteId,
-                            candidate: event.candidate
-                        }));
-                    }
-                };
-                return peerConnection;
-            }
-
-            // シンナリングサーバーからのメッセージを
-            signalingConnection.onmessage = async (event) => {
-                console.log("Received data type:", typeof event.data);
-                let messageData;
-                if (event.data instanceof Blob) {
-                    messageData = await event.data.text();
-                } else {
-                    messageData = event.data;
-                }
-
-                const message = JSON.parse(messageData);
-                switch (message.type) {
-                    case "init":
-                        myID = message.id;
-                        console.log("My ID is " + myID);
-                        message.connected.forEach(async (remoteId) => {
-                            if (remoteId !== myID) {
-                                const peerConnection = setupPeerConnection(remoteId);
-                                // Offerを作成
-                                const offer = await peerConnection.createOffer();
-                                await peerConnection.setLocalDescription(offer);
-                                signalingConnection.send(JSON.stringify({
-                                    type: "offer",
-                                    from: myID,
-                                    to: remoteId,
-                                    sdp: offer.sdp
-                                }));
-                            }
-                        });
-                        break;
-                    case "offer":
-                        if (!peerConnections.has(message.from)) {
-                            setupPeerConnection(message.from);
-                        }
-                        
-                        // Remote側のSDPを設定する
-                        const pc = peerConnections.get(message.from);
-                        await pc.setRemoteDescription(new RTCSessionDescription({
-                            type: "offer",
-                            sdp: message.sdp
-                        }));
-                        const answer = await pc.createAnswer();
-                        await pc.setLocalDescription(answer);
-                        // Answerを作成
-                        signalingConnection.send(JSON.stringify({
-                            type: "answer",
-                            from: myID,
-                            to: message.from,
-                            sdp: answer.sdp
-                        }));
-
-                        
-                        
-                        break;
-                    case "answer":
-                        if (peerConnections.has(message.from)) {
-                            const pc = peerConnections.get(message.from);
-                            await pc.setRemoteDescription(new RTCSessionDescription({
-                                type: "answer",
-                                sdp: message.sdp
-                            }));
-                            console.log("Answer received from " + message.from);
-                        }
-                        break;
-                    case "ice":
-                        if (peerConnections.has(message.from)) {
-                            const pc = peerConnections.get(message.from);
-                            if (message.candidate) {
-                                await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
-                                console.log("ICE Candidate received");
-                            }
-                        }
-                        break;
-                }
-            };
-        </script>
-    </body>
-</html>
+console.log("Signaling server running on ws://localhost:8081");
